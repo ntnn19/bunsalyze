@@ -170,7 +170,10 @@ def is_valid_hbond(
 
     theta_lp = None
     if ignore_ligand_intramolecular_hbonds:
-        if donor_atom.is_ligand_atom and acceptor_atom.is_ligand_atom:
+        # Only ignore hbonds within the SAME ligand residue. With multiple ligand residues,
+        # hbonds between different ligands are intermolecular and still count as satisfying.
+        if (donor_atom.is_ligand_atom and acceptor_atom.is_ligand_atom
+                and donor_atom.parent_group_identifier == acceptor_atom.parent_group_identifier):
             if debug: print(donor_atom.name, donor_hydrogen.name, acceptor_atom.name, False, 'ignoring ligand intramolecular hbonds')
             return False
 

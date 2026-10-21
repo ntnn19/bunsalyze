@@ -33,6 +33,47 @@ bunsalyze example_pdbs/epic_1.pdb 'CC[C@]1(O)C2=C(C(N3CC4=C5[C@@H]([NH3+])CCC6=C
 
 Alternatively, install with `pip install .` and run with `bunsalyze ...`.
 
+#### Multiple ligands
+
+Complexes containing more than one ligand residue are supported. The `smiles` argument
+maps onto ligand residues in three ways:
+
+- **One SMILES** (string or single CLI argument): broadcast to every ligand residue —
+  e.g. multiple copies of the same ligand bound across a homomer.
+- **One SMILES per ligand residue** (CLI: space-separated; API: list): matched to ligand
+  residues sorted by (chain, resnum, icode) — use this for multiple *different* ligands.
+- **`{resname: smiles}` mapping** (API only): keyed by three-letter residue name —
+  e.g. `{'FAD': '...', 'NAP': '...'}`. Note this cannot distinguish two different ligands
+  that share a resname (e.g. AlphaFold3 names every SMILES-specified ligand `LIG`); use
+  the ordered-list form for those.
+
+```bash
+# two copies of the same ligand (chains L and M both resname LIG):
+bunsalyze complex.pdb 'CC(=O)NC1=CC=C(C=C1)O'
+
+# two different ligands, matched in (chain, resnum) order:
+bunsalyze complex.pdb 'CC(=O)NC1=CC=C(C=C1)O' 'CN1C=NC2=C1C(=O)N(C(=O)N2C)C'
+```
+
+Global scores aggregate over every ligand residue (`buns_score` remains
+`2 * len(ligand_buns) + len(protein_buns)` with `ligand_buns` spanning all copies; the
+output adds an `n_ligand_residues` field). **Per-ligand scores** are reported under
+`per_ligand`: one entry per ligand residue with its `residue_id`, its own `ligand_buns`,
+`n_ligand_buns`, `n_buried_ligand_polar_atoms`, `ligand_buried_binary_unsat`,
+`ligand_buried_per_atom_capacity`, and a per-site `shell_buns` block (shells expanded from
+that ligand alone — `shell_buns.cumulative_buns_score[1]` is the per-site equivalent of the
+recommended ranking score). Burial and the H-bond graph are still solved on the whole
+complex, so inter-ligand H-bonds and mutual burial are fully accounted; only the
+attribution is per residue. A protein BUN within shell range of two ligands is attributed
+to both sites, and protein BUNs outside every ligand's shells appear only in the global
+scores — so per-site scores need not sum to the global `buns_score`. Because bare atom names collide across copies,
+the per-atom ligand annotation dicts/lists (`ligand_atoms_sasa`, `ligand_atoms_in_hull`,
+`ligand_atoms_buried_sasa`, `ligand_atoms_considered_buried`, `ligand_per_atom_capacity`,
+`ligand_buried_per_atom_capacity`) use `name:chain:resname:resnum:icode` keys whenever more
+than one ligand residue is present (single-ligand output is unchanged). H-bonds between
+*different* ligand residues count as intermolecular; `--ignore_ligand_intramolecular_hbonds`
+only ignores H-bonds within the same ligand residue.
+
 Here is the result of the `-h`/`--help` flag:
 
 ```text
@@ -147,5 +188,5 @@ The `buns_capacity_score` is the sum of the ligand_buried_per_atom_capacity valu
 
 
 ### TODO:
-- [ ] Add support for multiple ligands
+- [x] Add support for multiple ligands
 - [ ] Support NCAAs with planar aromatic groups similar to HIS.

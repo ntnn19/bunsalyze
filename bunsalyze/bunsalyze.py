@@ -4,8 +4,8 @@ import json
 import ast
 from pathlib import Path
 from pprint import pprint
-from collections import defaultdict
-from typing import Sequence
+from collections import defaultdict, namedtuple
+from typing import Mapping, Sequence
 
 _thread_vars = {
     "OMP_NUM_THREADS": "1",
@@ -119,20 +119,83 @@ def compute_shell_buns(
     }
 
 
-def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles: str, ligand_selection_string: str):
-    prot_ag = pr_complex.select(f'not {ligand_selection_string}').copy()
-    lig_ag = pr_complex.select(ligand_selection_string).copy()
+# One ligand residue with its RDKit molecules: `res_ag` is the single-residue prody
+# AtomGroup, `smi_mol` the SMILES template used for bond-order assignment, `lig_mol` the
+# RDKit mol built from that residue's PDB coordinates, and `residue_id` a human-readable
+# label used in error messages.
+LigandEntry = namedtuple('LigandEntry', ['res_ag', 'smi_mol', 'lig_mol', 'residue_id'])
 
-    if len(set(lig_ag.getResindices())) > 1:
-        raise NotImplementedError(
-            f"Multiple residues in ligand after selecting by \'{ligand_selection_string}\' " 
-            "Only single residue ligands are currently supported since we only take one smiles string as input. "
-            "Try setting --override_ligand_selection_string to a more specific selection."
+
+def _resolve_smiles_per_residue(smiles, residues) -> list:
+    """Map user-supplied SMILES onto ligand residues.
+
+    `smiles` may be:
+      - a single SMILES string (or single-element sequence): broadcast to every ligand
+        residue (e.g. multiple copies of the same ligand in a homomer);
+      - a sequence with one SMILES per ligand residue, matched to ligand residues sorted
+        by (chain, resnum, icode);
+      - a mapping of three-letter residue name -> SMILES (e.g. {'FAD': '...', 'NAP': '...'}).
+
+    `residues` is a list of (resname, residue_id) tuples in that same sorted order.
+    """
+    if isinstance(smiles, str):
+        return [smiles] * len(residues)
+    if isinstance(smiles, Mapping):
+        resolved = []
+        for resname, residue_id in residues:
+            if resname not in smiles:
+                raise ValueError(
+                    f"No SMILES provided for ligand residue {residue_id}. "
+                    f"SMILES were given for resnames: {sorted(smiles)}."
+                )
+            resolved.append(smiles[resname])
+        return resolved
+    smiles = list(smiles)
+    if len(smiles) == 1:
+        return smiles * len(residues)
+    if len(smiles) != len(residues):
+        raise ValueError(
+            f"Got {len(smiles)} SMILES strings but the ligand selection matches "
+            f"{len(residues)} residues ({', '.join(label for _, label in residues)}). Provide "
+            "either one SMILES (broadcast to all ligand residues) or one SMILES per ligand "
+            "residue in (chain, resnum, icode) order."
         )
+    return list(smiles)
 
-    smi_mol = Chem.MolFromSmiles(smiles)
-    if smi_mol is None:
-        raise ValueError(f"RDKit could not parse the ligand SMILES: {smiles!r}")
+
+def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles, ligand_selection_string: str):
+    """Split the complex into protein and ligand atom groups and build one RDKit mol per
+    ligand residue.
+
+    Multiple ligand residues are supported; see `_resolve_smiles_per_residue` for how
+    `smiles` is mapped onto residues. Returns (prot_ag, lig_ag, ligand_entries) where
+    `lig_ag` is the combined ligand AtomGroup and `ligand_entries` is a list of
+    LigandEntry, one per ligand residue, sorted by (chain, resnum, icode).
+    """
+    prot_ag = pr_complex.select(f'not {ligand_selection_string}').copy()
+    lig_sel = pr_complex.select(ligand_selection_string)
+    if lig_sel is None or lig_sel.numAtoms() == 0:
+        raise ValueError(
+            f"Ligand selection '{ligand_selection_string}' matched no atoms. "
+            "Check --override_ligand_selection_string."
+        )
+    lig_ag = lig_sel.copy()
+
+    # Enumerate ligand residues in deterministic (chain, resnum, icode) order.
+    resindices, chids, resnums, icodes, resnames = (
+        lig_ag.getResindices(), lig_ag.getChids(), lig_ag.getResnums(),
+        lig_ag.getIcodes(), lig_ag.getResnames(),
+    )
+    seen, residues = set(), []
+    for i, ridx in enumerate(resindices):
+        if ridx not in seen:
+            seen.add(ridx)
+            residues.append((ridx, str(chids[i]), int(resnums[i]), str(icodes[i]), str(resnames[i])))
+    residues.sort(key=lambda r: (r[1], r[2], r[3]))
+
+    smiles_per_residue = _resolve_smiles_per_residue(
+        smiles, [(r[4], f"{r[4]}:{r[1]}:{r[2]}{r[3]}") for r in residues]
+    )
 
     # Precondition: every ligand atom must carry an element. bunsalyze relies on per-atom elements
     # for H-bond donor/acceptor and burial analysis (e.g. prody `element H within ...` in
@@ -149,25 +212,51 @@ def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles: str, 
             f"requires per-atom elements; fix the upstream PDB writer to emit the element column."
         )
 
-    buff = io.StringIO()
-    pr.writePDBStream(buff, lig_ag.copy())
-    lig_mol = Chem.MolFromPDBBlock(buff.getvalue())
-    if lig_mol is None:
-        raise ValueError(
-            f"RDKit could not build the ligand molecule (MolFromPDBBlock returned None) for selection "
-            f"'{ligand_selection_string}'. Common cause: missing/ambiguous element symbols (e.g. "
-            f"halogens) in the ligand PDB records."
-        )
-    lig_mol = AllChem.AssignBondOrdersFromTemplate(smi_mol, lig_mol)
+    ligand_entries = []
+    for (ridx, chid, resnum, icode, resname), smi in zip(residues, smiles_per_residue):
+        residue_id = f"{resname}:{chid}:{resnum}{icode}"
+        smi_mol = Chem.MolFromSmiles(smi)
+        if smi_mol is None:
+            raise ValueError(f"RDKit could not parse the ligand SMILES: {smi!r}")
 
-    return prot_ag, lig_ag, smi_mol, lig_mol
+        res_ag = lig_ag.select(f'resindex {ridx}').toAtomGroup()
+        buff = io.StringIO()
+        pr.writePDBStream(buff, res_ag)
+        lig_mol = Chem.MolFromPDBBlock(buff.getvalue())
+        if lig_mol is None:
+            raise ValueError(
+                f"RDKit could not build the ligand molecule (MolFromPDBBlock returned None) for "
+                f"ligand residue {residue_id}. Common cause: missing/ambiguous element symbols "
+                f"(e.g. halogens) in the ligand PDB records."
+            )
+        try:
+            lig_mol = AllChem.AssignBondOrdersFromTemplate(smi_mol, lig_mol)
+        except Exception as e:
+            raise ValueError(
+                f"Could not assign bond orders for ligand residue {residue_id} from SMILES "
+                f"{smi!r}: {e}. If the complex contains multiple different ligands, provide one "
+                "SMILES per ligand residue (matched in chain/resnum order) or a "
+                "{resname: SMILES} mapping."
+            ) from e
+        ligand_entries.append(LigandEntry(res_ag=res_ag, smi_mol=smi_mol, lig_mol=lig_mol, residue_id=residue_id))
+
+    return prot_ag, lig_ag, ligand_entries
+
+
+def _ligand_atom_label(atom: PolarAtom, multi_ligand: bool) -> str:
+    """Key for ligand-atom annotation dicts. Bare atom names collide across ligand copies,
+    so qualify with the residue identity when the complex has multiple ligand residues."""
+    if not multi_ligand:
+        return atom.name
+    chain, resname, resnum, icode, *_ = atom.parent_group_identifier
+    return f"{atom.name}:{chain}:{resname}:{resnum}:{icode}"
 
 
 def set_burial_annotations(
     ligand_polar_atoms: Sequence[PolarAtom], protein_polar_atoms: Sequence[PolarAtom], 
     ca_coords: np.ndarray, input_path: os.PathLike, sasa_threshold: float, silent: bool,
     alpha_hull_alpha: float, ignore_sasa_threshold: bool, ignore_all_burial_criteria: bool,
-    ignore_ligand_sasa_threshold: bool
+    ignore_ligand_sasa_threshold: bool, multi_ligand: bool = False
 ):
     ligand_burial_mask, protein_burial_mask = None, None
     if not ignore_all_burial_criteria:
@@ -181,15 +270,16 @@ def set_burial_annotations(
     if not silent: print(f'Ligand Atom SASA: (< {sasa_threshold} A^2 == buried)')
     for i, atom in enumerate(ligand_polar_atoms):
         atom_name = atom.name
+        label = _ligand_atom_label(atom, multi_ligand)
         chain, resname, resnum, *_ = atom.parent_group_identifier
 
         sasa = freesasa.selectArea([f's1, name {atom_name} and resn {resname} and chain {chain} and resi {resnum}'], freesasa_struct, sasa_data)['s1']
 
-        ligand_burial_annotations['ligand_atoms_sasa'][atom_name] = sasa
+        ligand_burial_annotations['ligand_atoms_sasa'][label] = sasa
         if ignore_all_burial_criteria or ligand_burial_mask[i].item():
-            ligand_burial_annotations['ligand_atoms_in_hull'].append(atom_name)
+            ligand_burial_annotations['ligand_atoms_in_hull'].append(label)
         if sasa < sasa_threshold:
-            ligand_burial_annotations['ligand_atoms_buried_sasa'].append(atom_name)
+            ligand_burial_annotations['ligand_atoms_buried_sasa'].append(label)
 
         if ignore_all_burial_criteria:
             atom.is_buried = True
@@ -197,9 +287,9 @@ def set_burial_annotations(
             atom.is_buried = ligand_burial_mask[i].item() and ((sasa < sasa_threshold) or ignore_sasa_threshold or ignore_ligand_sasa_threshold)
         
         if atom.is_buried:
-            ligand_burial_annotations['ligand_atoms_considered_buried'].append(atom_name)
+            ligand_burial_annotations['ligand_atoms_considered_buried'].append(label)
 
-        if not silent: print(f'\t{atom_name} {sasa}')
+        if not silent: print(f'\t{label} {sasa}')
 
     for i, atom in enumerate(protein_polar_atoms):
         atom_name = atom.name
@@ -214,7 +304,8 @@ def set_burial_annotations(
 
 
 def compute_capacity_score(
-    ligand_polar_atoms: Sequence[PolarAtom], protein_polar_atoms: Sequence[PolarAtom]
+    ligand_polar_atoms: Sequence[PolarAtom], protein_polar_atoms: Sequence[PolarAtom],
+    multi_ligand: bool = False
 ) -> dict:
     ligand_per_atom_capacity = {}
     buried_ligand_per_atom_capacity = {}
@@ -240,9 +331,10 @@ def compute_capacity_score(
                         max_buried_capacity += atom.max_donor_count + atom.max_acceptor_count
                     
                     if idx == 0:
+                        label = _ligand_atom_label(atom, multi_ligand)
                         if atom.is_buried:
-                            buried_ligand_per_atom_capacity[atom.name] = (atom.donor_count + atom.acceptor_count) / (atom.max_donor_count + atom.max_acceptor_count) if (atom.max_donor_count + atom.max_acceptor_count) > 0 else 1.0
-                        ligand_per_atom_capacity[atom.name] = (atom.donor_count + atom.acceptor_count) / (atom.max_donor_count + atom.max_acceptor_count) if (atom.max_donor_count + atom.max_acceptor_count) > 0 else 1.0
+                            buried_ligand_per_atom_capacity[label] = (atom.donor_count + atom.acceptor_count) / (atom.max_donor_count + atom.max_acceptor_count) if (atom.max_donor_count + atom.max_acceptor_count) > 0 else 1.0
+                        ligand_per_atom_capacity[label] = (atom.donor_count + atom.acceptor_count) / (atom.max_donor_count + atom.max_acceptor_count) if (atom.max_donor_count + atom.max_acceptor_count) > 0 else 1.0
 
             # Calculate the fraction of capacity satisfied for buried and non-buried atoms.
             fraction_buried_capacity_satisfied = (max_buried_capacity - buried_remaining_capacity) / max_buried_capacity if max_buried_capacity else 1.0
@@ -267,7 +359,7 @@ def compute_capacity_score(
 
 
 def main(
-    input_path: os.PathLike, smiles: str,
+    input_path: os.PathLike, smiles,
     sasa_threshold: float = 2.5, silent: bool = True, disable_hydrogen_clash_check: bool = False,
     alpha_hull_alpha: float = 14.0, override_ligand_selection_string: str = 'not protein',
     ncaa_dict: dict = {}, ignore_sulfur_acceptors: bool = False, ignore_sasa_threshold: bool = False,
@@ -280,15 +372,23 @@ def main(
     protein_complex = pr.parsePDB(str(input_path))
     assert protein_complex is not None, f"Failed to parse PDB file at {input_path}"
 
-    # Load the relevant protein and ligand data.
-    prot_ag, lig_ag, smi_mol, lig_mol = parse_complex_and_build_rdkit_ligand(protein_complex, smiles, override_ligand_selection_string)
-    lig_cap = compute_ligand_capacity(lig_mol)
+    # Load the relevant protein and ligand data. One RDKit mol is built per ligand residue;
+    # a single SMILES is broadcast to all residues (e.g. multiple copies of the same ligand).
+    prot_ag, lig_ag, ligand_entries = parse_complex_and_build_rdkit_ligand(protein_complex, smiles, override_ligand_selection_string)
+    multi_ligand = len(ligand_entries) > 1
     ca_coords = prot_ag.select('name CA').getCoords()
 
-    # Get the hbond-able polar atoms.
-    ligand_polar_atoms = get_ligand_polar_atoms(lig_cap, lig_ag, lig_mol, covalent_hydrogen_max_distance=covalent_hydrogen_max_distance)
+    # Get the hbond-able polar atoms. Atom names are unique within a single residue, so the
+    # per-residue AtomGroup keeps the name-based lookups in get_ligand_polar_atoms unambiguous.
+    ligand_polar_atoms = []
+    for entry in ligand_entries:
+        lig_cap = compute_ligand_capacity(entry.lig_mol)
+        ligand_polar_atoms.extend(get_ligand_polar_atoms(
+            lig_cap, entry.res_ag, entry.lig_mol,
+            covalent_hydrogen_max_distance=covalent_hydrogen_max_distance,
+        ))
     protein_polar_atoms = get_protein_polar_atoms(prot_ag, ncaa_dict=ncaa_dict, use_sulfur_acceptors=not ignore_sulfur_acceptors, use_ca_donors=use_ca_donors, silent=silent)
-    ligand_burial_annotations = set_burial_annotations(ligand_polar_atoms, protein_polar_atoms, ca_coords, input_path, sasa_threshold=sasa_threshold, silent=silent, alpha_hull_alpha=alpha_hull_alpha, ignore_sasa_threshold=ignore_sasa_threshold, ignore_all_burial_criteria=ignore_all_burial_criteria, ignore_ligand_sasa_threshold=ignore_ligand_sasa_threshold)
+    ligand_burial_annotations = set_burial_annotations(ligand_polar_atoms, protein_polar_atoms, ca_coords, input_path, sasa_threshold=sasa_threshold, silent=silent, alpha_hull_alpha=alpha_hull_alpha, ignore_sasa_threshold=ignore_sasa_threshold, ignore_all_burial_criteria=ignore_all_burial_criteria, ignore_ligand_sasa_threshold=ignore_ligand_sasa_threshold, multi_ligand=multi_ligand)
 
     # Build a radius graph of the polar atoms and compute the buns for the ligand and protein.
     g = PolarAtomGraph(
@@ -304,7 +404,7 @@ def main(
     )
     ligand_buried_binary_unsat = len(ligand_buns) / n_buried_lig if n_buried_lig > 0 else 0.0
 
-    fraction_unsat_dicts = compute_capacity_score(ligand_polar_atoms, protein_polar_atoms)
+    fraction_unsat_dicts = compute_capacity_score(ligand_polar_atoms, protein_polar_atoms, multi_ligand=multi_ligand)
 
     protein_buns_tuples = [(str(i.name), *i.parent_group_identifier, i.is_weak_acceptor) for i in protein_buns]
     shell_assignment = compute_shell_residues(lig_ag, prot_ag, shell_dist=shell_dist, n_shells=shells)
@@ -315,8 +415,49 @@ def main(
         shell_assignment, shells,
     )
 
+    # Per-ligand scores. Burial and the H-bond graph are solved on the whole complex (so
+    # inter-ligand H-bonds and mutual burial are fully accounted); only attribution is per
+    # residue: ligand BUNs belong to their residue, and each ligand's site score counts the
+    # protein BUNs within its own sidechain-contact shells. A protein BUN within shell range
+    # of two ligands is attributed to both sites; protein BUNs outside every ligand's shells
+    # appear only in the global scores.
+    per_ligand = []
+    for entry in ligand_entries:
+        res_key = (
+            str(entry.res_ag.getChids()[0]), str(entry.res_ag.getResnames()[0]),
+            int(entry.res_ag.getResnums()[0]), str(entry.res_ag.getIcodes()[0]),
+        )
+        atoms_i = [a for a in ligand_polar_atoms if a.parent_group_identifier == res_key]
+        buns_i = [a for a in ligand_buns if a.parent_group_identifier == res_key]
+        n_buried_i = sum(
+            1 for a in atoms_i
+            if a.is_buried and (report_weak_acceptor_buns or not a.is_weak_acceptor)
+        )
+        labels_i = {_ligand_atom_label(a, multi_ligand) for a in atoms_i}
+        cap_buried_i = {
+            k: v for k, v in fraction_unsat_dicts['ligand_buried_per_atom_capacity'].items()
+            if k in labels_i
+        }
+        shell_assignment_i = compute_shell_residues(entry.res_ag, prot_ag, shell_dist=shell_dist, n_shells=shells)
+        shell_buns_i = compute_shell_buns(
+            buns_i, protein_buns_tuples,
+            fraction_unsat_dicts['protein_buried_fraction_unsat'],
+            cap_buried_i, shell_assignment_i, shells,
+        )
+        per_ligand.append({
+            'residue_id': entry.residue_id,
+            'ligand_buns': [(str(a.name), *a.parent_group_identifier, a.is_weak_acceptor) for a in buns_i],
+            'n_ligand_buns': len(buns_i),
+            'n_buried_ligand_polar_atoms': n_buried_i,
+            'ligand_buried_binary_unsat': len(buns_i) / n_buried_i if n_buried_i > 0 else 0.0,
+            'ligand_buried_per_atom_capacity': cap_buried_i,
+            'shell_buns': {'shell_dist': shell_dist, 'n_shells': shells, **shell_buns_i},
+        })
+
     output = {
         'input_path': str(input_path),
+        'n_ligand_residues': len(ligand_entries),
+        'per_ligand': per_ligand,
         'ligand_buns': [(str(i.name), *i.parent_group_identifier, i.is_weak_acceptor) for i in ligand_buns],
         'protein_buns': [(str(i.name), *i.parent_group_identifier, i.is_weak_acceptor) for i in protein_buns],
         'buns_score': (2 * len(ligand_buns)) + len(protein_buns),
@@ -331,12 +472,22 @@ def main(
 
 
 
+def _jsonable(o):
+    """Recursively convert tuple dict keys (e.g. residue identifiers in the fraction_unsat
+    dicts) and tuples to JSON-serializable forms."""
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    return o
+
+
 def cli():
     """Command-line interface entry point."""
     import argparse
     parser = argparse.ArgumentParser(description="Analyze protein-ligand complexes for buried unsatisfied polar atoms (BUNs).")
     parser.add_argument("input_path", type=str, help="Path to the PDB file containing the protein-ligand complex")
-    parser.add_argument("smiles", type=str, help="SMILES string representing the ligand")
+    parser.add_argument("smiles", type=str, nargs='+', help="SMILES string(s) for the ligand(s). A single SMILES is broadcast to every ligand residue (e.g. multiple copies of the same ligand); with multiple different ligands, give one SMILES per ligand residue in (chain, resnum) order.")
     parser.add_argument("--sasa_threshold", type=float, default=2.5, help="SASA threshold for burial (default: 2.5 Å²)")
     parser.add_argument("--alpha_hull_alpha", type=float, default=14.0, help="Alpha-shape alpha parameter (larger = looser, closer to the convex hull; default is 14.0)")
     parser.add_argument("--output", type=str, help="Output file path (default: print to stdout)")
@@ -382,7 +533,7 @@ def cli():
     if args.output:
         pprint(results)
         with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(_jsonable(results), f, indent=2, default=str)
     else:
         pprint(results)
 
