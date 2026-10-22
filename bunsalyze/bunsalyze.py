@@ -134,21 +134,75 @@ def _resolve_smiles_per_residue(smiles, residues) -> list:
         residue (e.g. multiple copies of the same ligand in a homomer);
       - a sequence with one SMILES per ligand residue, matched to ligand residues sorted
         by (chain, resnum, icode);
-      - a mapping of three-letter residue name -> SMILES (e.g. {'FAD': '...', 'NAP': '...'}).
+      - a mapping locating residues by resname, chain ID, or 'chain:resnum' (see below).
 
-    `residues` is a list of (resname, residue_id) tuples in that same sorted order.
+    `residues` is a list of (resname, chain, resnum, icode, residue_id) tuples in that
+    same sorted order.
+
+    Mapping keys:
+      - a residue name ('FAD'): covers every ligand residue with that resname;
+      - a chain ID ('B'): covers the ligand residue in that chain — rejected if the
+        chain contains more than one ligand residue (use 'chain:resnum' then);
+      - 'chain:resnum' ('B:501', optionally with icode, 'B:501A'): covers exactly one
+        ligand residue.
+    Every key must match at least one residue, every residue must be covered exactly
+    once, and a key that is both a chain ID and a resname among the selected ligand
+    residues is rejected as ambiguous.
     """
     if isinstance(smiles, str):
         return [smiles] * len(residues)
     if isinstance(smiles, Mapping):
-        resolved = []
-        for resname, residue_id in residues:
-            if resname not in smiles:
+        chains = {r[1] for r in residues}
+        resnames = {r[0] for r in residues}
+        resolved = [None] * len(residues)
+        for key, smi in smiles.items():
+            key = str(key)
+            if ':' in key:
+                kchain, kres = key.split(':', 1)
+                matches = [
+                    i for i, r in enumerate(residues)
+                    if r[1] == kchain and (kres == str(r[2]) or (r[3] and kres == f"{r[2]}{r[3]}"))
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"SMILES mapping key {key!r} matches {len(matches)} ligand residues; "
+                        f"expected exactly one. Ligand residues: "
+                        f"{', '.join(r[4] for r in residues)}."
+                    )
+            elif key in chains and key in resnames:
                 raise ValueError(
-                    f"No SMILES provided for ligand residue {residue_id}. "
-                    f"SMILES were given for resnames: {sorted(smiles)}."
+                    f"SMILES mapping key {key!r} is ambiguous: it is both a chain ID and a "
+                    "residue name among the selected ligand residues. Use the "
+                    "'chain:resnum' form instead."
                 )
-            resolved.append(smiles[resname])
+            elif key in chains:
+                matches = [i for i, r in enumerate(residues) if r[1] == key]
+                if len(matches) > 1:
+                    raise ValueError(
+                        f"SMILES mapping key {key!r} matches {len(matches)} ligand residues in "
+                        f"chain {key} ({', '.join(residues[i][4] for i in matches)}). Use the "
+                        "'chain:resnum' form to specify them individually."
+                    )
+            elif key in resnames:
+                matches = [i for i, r in enumerate(residues) if r[0] == key]
+            else:
+                raise ValueError(
+                    f"SMILES mapping key {key!r} matches no ligand residue. Available chain "
+                    f"IDs: {sorted(chains)}; resnames: {sorted(resnames)}."
+                )
+            for i in matches:
+                if resolved[i] is not None:
+                    raise ValueError(
+                        f"Ligand residue {residues[i][4]} is covered by more than one SMILES "
+                        "mapping key."
+                    )
+                resolved[i] = smi
+        uncovered = [r[4] for r, s in zip(residues, resolved) if s is None]
+        if uncovered:
+            raise ValueError(
+                f"No SMILES provided for ligand residue(s): {', '.join(uncovered)}. "
+                f"Mapping keys were: {sorted(str(k) for k in smiles)}."
+            )
         return resolved
     smiles = list(smiles)
     if len(smiles) == 1:
@@ -156,7 +210,7 @@ def _resolve_smiles_per_residue(smiles, residues) -> list:
     if len(smiles) != len(residues):
         raise ValueError(
             f"Got {len(smiles)} SMILES strings but the ligand selection matches "
-            f"{len(residues)} residues ({', '.join(label for _, label in residues)}). Provide "
+            f"{len(residues)} residues ({', '.join(r[4] for r in residues)}). Provide "
             "either one SMILES (broadcast to all ligand residues) or one SMILES per ligand "
             "residue in (chain, resnum, icode) order."
         )
@@ -194,7 +248,7 @@ def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles, ligan
     residues.sort(key=lambda r: (r[1], r[2], r[3]))
 
     smiles_per_residue = _resolve_smiles_per_residue(
-        smiles, [(r[4], f"{r[4]}:{r[1]}:{r[2]}{r[3]}") for r in residues]
+        smiles, [(r[4], r[1], r[2], r[3], f"{r[4]}:{r[1]}:{r[2]}{r[3]}") for r in residues]
     )
 
     # Precondition: every ligand atom must carry an element. bunsalyze relies on per-atom elements
@@ -487,7 +541,8 @@ def cli():
     import argparse
     parser = argparse.ArgumentParser(description="Analyze protein-ligand complexes for buried unsatisfied polar atoms (BUNs).")
     parser.add_argument("input_path", type=str, help="Path to the PDB file containing the protein-ligand complex")
-    parser.add_argument("smiles", type=str, nargs='+', help="SMILES string(s) for the ligand(s). A single SMILES is broadcast to every ligand residue (e.g. multiple copies of the same ligand); with multiple different ligands, give one SMILES per ligand residue in (chain, resnum) order.")
+    parser.add_argument("smiles", type=str, nargs='*', help="SMILES string(s) for the ligand(s). A single SMILES is broadcast to every ligand residue (e.g. multiple copies of the same ligand); with multiple different ligands, give one SMILES per ligand residue in (chain, resnum) order, or use --smiles_map.")
+    parser.add_argument('--smiles_map', type=str, default='', help='Dictionary string mapping ligand residues to SMILES, keyed by resname, chain ID, or chain:resnum — e.g. \'{"FAD": "..."}\' or \'{"B": "...", "C": "..."}\'. Alternative to positional SMILES; the fail-proof option for multiple different ligands.')
     parser.add_argument("--sasa_threshold", type=float, default=2.5, help="SASA threshold for burial (default: 2.5 Å²)")
     parser.add_argument("--alpha_hull_alpha", type=float, default=14.0, help="Alpha-shape alpha parameter (larger = looser, closer to the convex hull; default is 14.0)")
     parser.add_argument("--output", type=str, help="Output file path (default: print to stdout)")
@@ -518,8 +573,21 @@ def cli():
     if not input_path.exists():
         raise FileNotFoundError(f"Input file {args.input_path} does not exist.")
 
+    if args.smiles and args.smiles_map:
+        parser.error("Provide either positional SMILES or --smiles_map, not both.")
+    if not args.smiles and not args.smiles_map:
+        parser.error("Provide ligand SMILES: positional argument(s) or --smiles_map.")
+    smiles = args.smiles
+    if args.smiles_map:
+        try:
+            smiles = ast.literal_eval(args.smiles_map)
+        except Exception as e:
+            raise ValueError(f"Error parsing --smiles_map argument: {e}. Provide a dictionary string, e.g. {{'B': 'CCO'}}")
+        if not isinstance(smiles, dict):
+            raise ValueError(f"--smiles_map must be a dictionary string, e.g. {{'B': 'CCO'}}; got {type(smiles).__name__}.")
+
     results = main(
-        args.input_path, args.smiles,
+        args.input_path, smiles,
         sasa_threshold=args.sasa_threshold, silent=not args.verbose, disable_hydrogen_clash_check=args.disable_hydrogen_clash_check,
         alpha_hull_alpha=args.alpha_hull_alpha, override_ligand_selection_string=args.override_ligand_selection_string,
         ncaa_dict=ncaa_dict, ignore_sulfur_acceptors=args.ignore_sulfur_acceptors,

@@ -42,10 +42,16 @@ maps onto ligand residues in three ways:
   e.g. multiple copies of the same ligand bound across a homomer.
 - **One SMILES per ligand residue** (CLI: space-separated; API: list): matched to ligand
   residues sorted by (chain, resnum, icode) — use this for multiple *different* ligands.
-- **`{resname: smiles}` mapping** (API only): keyed by three-letter residue name —
-  e.g. `{'FAD': '...', 'NAP': '...'}`. Note this cannot distinguish two different ligands
-  that share a resname (e.g. AlphaFold3 names every SMILES-specified ligand `LIG`); use
-  the ordered-list form for those.
+- **A mapping** (API: dict; CLI: `--smiles_map '{...}'`) locating each ligand residue by:
+  - **resname** — `{'FAD': '...'}` covers every FAD copy (but cannot distinguish two
+    different ligands sharing a resname; AlphaFold3 names every SMILES-specified ligand
+    `LIG`, so prefer chain keys for AF3 outputs);
+  - **chain ID** — `{'B': '...', 'C': '...'}` covers the ligand residue in that chain
+    (rejected if a chain contains more than one ligand residue);
+  - **chain:resnum** — `{'B:501': '...'}` covers exactly one residue.
+  The mapping is validated: every key must match a ligand residue, every residue must be
+  covered exactly once, and keys that are simultaneously a chain ID and a resname are
+  rejected as ambiguous. This is the fail-proof option for multiple different ligands.
 
 ```bash
 # two copies of the same ligand (chains L and M both resname LIG):
@@ -53,6 +59,9 @@ bunsalyze complex.pdb 'CC(=O)NC1=CC=C(C=C1)O'
 
 # two different ligands, matched in (chain, resnum) order:
 bunsalyze complex.pdb 'CC(=O)NC1=CC=C(C=C1)O' 'CN1C=NC2=C1C(=O)N(C(=O)N2C)C'
+
+# two different ligands, keyed explicitly by chain ID (fail-proof):
+bunsalyze complex.pdb --smiles_map '{"B": "CC(=O)NC1=CC=C(C=C1)O", "C": "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"}'
 ```
 
 Global scores aggregate over every ligand residue (`buns_score` remains
