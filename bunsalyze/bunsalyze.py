@@ -1,7 +1,9 @@
 import os
 import io
+import sys
 import json
 import ast
+import tempfile
 from pathlib import Path
 from pprint import pprint
 from collections import defaultdict, namedtuple
@@ -28,6 +30,9 @@ from rdkit.Chem import AllChem
 
 from bunsalyze.utils.constants import PolarAtom 
 from bunsalyze.utils.calc_ligand_dons_accs import get_ligand_polar_atoms, compute_ligand_capacity
+from bunsalyze.utils.chemistry import (
+    candidate_templates, assign_bond_orders, GENERIC_RESNAMES,
+)
 from bunsalyze.utils.calc_protein_dons_accs import get_protein_polar_atoms
 from bunsalyze.utils.burial_calc import compute_fast_ligand_burial_mask
 from bunsalyze.utils.graph import PolarAtomGraph
@@ -123,18 +128,23 @@ def compute_shell_buns(
 # AtomGroup, `smi_mol` the SMILES template used for bond-order assignment, `lig_mol` the
 # RDKit mol built from that residue's PDB coordinates, and `residue_id` a human-readable
 # label used in error messages.
-LigandEntry = namedtuple('LigandEntry', ['res_ag', 'smi_mol', 'lig_mol', 'residue_id'])
+LigandEntry = namedtuple('LigandEntry', ['res_ag', 'smi_mol', 'lig_mol', 'residue_id',
+                                         'chemistry_source', 'chemistry_smiles'],
+                         defaults=[None, None])
 
 
 def _resolve_smiles_per_residue(smiles, residues) -> list:
     """Map user-supplied SMILES onto ligand residues.
 
     `smiles` may be:
+      - None: every ligand residue is auto-resolved (mmCIF bond table -> CCD
+        lookup -> geometry perception); see utils/chemistry.py;
       - a single SMILES string (or single-element sequence): broadcast to every ligand
         residue (e.g. multiple copies of the same ligand in a homomer);
       - a sequence with one SMILES per ligand residue, matched to ligand residues sorted
         by (chain, resnum, icode);
       - a mapping locating residues by resname, chain ID, or 'chain:resnum' (see below).
+        Residues not covered by the mapping are auto-resolved (None entries).
 
     `residues` is a list of (resname, chain, resnum, icode, residue_id) tuples in that
     same sorted order.
@@ -145,10 +155,13 @@ def _resolve_smiles_per_residue(smiles, residues) -> list:
         chain contains more than one ligand residue (use 'chain:resnum' then);
       - 'chain:resnum' ('B:501', optionally with icode, 'B:501A'): covers exactly one
         ligand residue.
-    Every key must match at least one residue, every residue must be covered exactly
-    once, and a key that is both a chain ID and a resname among the selected ligand
-    residues is rejected as ambiguous.
+    Every key must match at least one residue, no residue may be covered by more than
+    one key, and a key that is both a chain ID and a resname among the selected ligand
+    residues is rejected as ambiguous. Residues left uncovered keep None and are
+    auto-resolved.
     """
+    if smiles is None:
+        return [None] * len(residues)
     if isinstance(smiles, str):
         return [smiles] * len(residues)
     if isinstance(smiles, Mapping):
@@ -197,12 +210,8 @@ def _resolve_smiles_per_residue(smiles, residues) -> list:
                         "mapping key."
                     )
                 resolved[i] = smi
-        uncovered = [r[4] for r, s in zip(residues, resolved) if s is None]
-        if uncovered:
-            raise ValueError(
-                f"No SMILES provided for ligand residue(s): {', '.join(uncovered)}. "
-                f"Mapping keys were: {sorted(str(k) for k in smiles)}."
-            )
+        # Residues not covered by the mapping keep None and are auto-resolved
+        # (mmCIF bond table -> CCD lookup -> geometry perception).
         return resolved
     smiles = list(smiles)
     if len(smiles) == 1:
@@ -217,17 +226,59 @@ def _resolve_smiles_per_residue(smiles, residues) -> list:
     return list(smiles)
 
 
-def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles, ligand_selection_string: str):
+DEFAULT_LIGAND_SELECTION = 'not protein and not nucleic and not water and not ion'
+
+_ION_KEYWORD_FALLBACK = 'not resname NA CL K CA MG ZN FE CU MN I BR'
+
+
+def _select_compat(ag, sel: str):
+    """prody select() with a fallback for ProDy versions lacking the 'ion' keyword."""
+    try:
+        return ag.select(sel)
+    except Exception:
+        if 'not ion' not in sel:
+            raise
+        return ag.select(sel.replace('not ion', _ION_KEYWORD_FALLBACK))
+
+
+_MMCIF_SUFFIXES = ('.cif', '.mmcif', '.bcif')
+
+
+def _parse_mmcif_compat(path: str):
+    """Parse an mmCIF structure. ProDy handles plain-text mmCIF; binary CIF (.bcif)
+    is converted through gemmi to an in-memory PDB first."""
+    if not path.lower().endswith('.bcif'):
+        try:
+            return pr.parseMMCIF(path)
+        except Exception:
+            pass  # fall through to the gemmi route
+    import gemmi
+    st = gemmi.read_structure(path)
+    return pr.parsePDBStream(io.StringIO(st.make_pdb_string()))
+
+
+def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles, ligand_selection_string: str,
+                                         input_path: str = "", allow_ccd_lookup: bool = True):
     """Split the complex into protein and ligand atom groups and build one RDKit mol per
     ligand residue.
 
     Multiple ligand residues are supported; see `_resolve_smiles_per_residue` for how
-    `smiles` is mapped onto residues. Returns (prot_ag, lig_ag, ligand_entries) where
-    `lig_ag` is the combined ligand AtomGroup and `ligand_entries` is a list of
-    LigandEntry, one per ligand residue, sorted by (chain, resnum, icode).
+    `smiles` is mapped onto residues. Residues without a user SMILES are auto-resolved
+    (input mmCIF bond table -> CCD lookup -> geometry perception; see
+    utils/chemistry.py); residues for which no source yields a matching template are
+    excluded from scoring. Returns (prot_ag, lig_ag, ligand_entries, excluded) where
+    `lig_ag` is the combined ligand AtomGroup (excluded residues removed),
+    `ligand_entries` is a list of LigandEntry sorted by (chain, resnum, icode), and
+    `excluded` is a list of {'residue_id', 'reason'} dicts.
     """
-    prot_ag = pr_complex.select(f'not {ligand_selection_string}').copy()
-    lig_sel = pr_complex.select(ligand_selection_string)
+    # Protein side: complement of the ligand selection, minus water/ions/nucleic
+    # (inert for the amino-acid-template-driven protein polar atom code, which
+    # raises on unknown resnames). With the default selection this is exactly
+    # 'protein', identical to the historical behavior.
+    prot_ag = _select_compat(
+        pr_complex, f'not ({ligand_selection_string}) and not water and not ion and not nucleic'
+    ).copy()
+    lig_sel = _select_compat(pr_complex, ligand_selection_string)
     if lig_sel is None or lig_sel.numAtoms() == 0:
         raise ValueError(
             f"Ligand selection '{ligand_selection_string}' matched no atoms. "
@@ -267,34 +318,88 @@ def parse_complex_and_build_rdkit_ligand(pr_complex: pr.AtomGroup, smiles, ligan
         )
 
     ligand_entries = []
+    excluded = []
+    kept_resindices = []
     for (ridx, chid, resnum, icode, resname), smi in zip(residues, smiles_per_residue):
         residue_id = f"{resname}:{chid}:{resnum}{icode}"
-        smi_mol = Chem.MolFromSmiles(smi)
-        if smi_mol is None:
-            raise ValueError(f"RDKit could not parse the ligand SMILES: {smi!r}")
-
         res_ag = lig_ag.select(f'resindex {ridx}').toAtomGroup()
         buff = io.StringIO()
         pr.writePDBStream(buff, res_ag)
-        lig_mol = Chem.MolFromPDBBlock(buff.getvalue())
-        if lig_mol is None:
-            raise ValueError(
-                f"RDKit could not build the ligand molecule (MolFromPDBBlock returned None) for "
-                f"ligand residue {residue_id}. Common cause: missing/ambiguous element symbols "
-                f"(e.g. halogens) in the ligand PDB records."
-            )
-        try:
-            lig_mol = AllChem.AssignBondOrdersFromTemplate(smi_mol, lig_mol)
-        except Exception as e:
-            raise ValueError(
-                f"Could not assign bond orders for ligand residue {residue_id} from SMILES "
-                f"{smi!r}: {e}. If the complex contains multiple different ligands, provide one "
-                "SMILES per ligand residue (matched in chain/resnum order) or a "
-                "{resname: SMILES} mapping."
-            ) from e
-        ligand_entries.append(LigandEntry(res_ag=res_ag, smi_mol=smi_mol, lig_mol=lig_mol, residue_id=residue_id))
+        pdb_block = buff.getvalue()
 
-    return prot_ag, lig_ag, ligand_entries
+        if smi is not None:
+            # User-supplied chemistry is authoritative: parse or mismatch errors are fatal.
+            smi_mol = Chem.MolFromSmiles(smi)
+            if smi_mol is None:
+                raise ValueError(f"RDKit could not parse the ligand SMILES: {smi!r}")
+            candidates = [(smi_mol, 'user', Chem.MolToSmiles(smi_mol))]
+        else:
+            candidates = candidate_templates(
+                resname, pdb_block, input_path=input_path, allow_ccd_lookup=allow_ccd_lookup)
+
+        lig_mol = None
+        if not (len(candidates) == 1 and candidates[0][1] == 'geometry_perception'):
+            lig_mol = Chem.MolFromPDBBlock(pdb_block)
+            if lig_mol is None and smi is not None:
+                raise ValueError(
+                    f"RDKit could not build the ligand molecule (MolFromPDBBlock returned None) for "
+                    f"ligand residue {residue_id}. Common cause: missing/ambiguous element symbols "
+                    f"(e.g. halogens) in the ligand PDB records."
+                )
+
+        entry = None
+        mismatch_errors = []
+        for template, source, canon in candidates:
+            if source == 'geometry_perception':
+                # The perceived mol is self-consistent; use it directly.
+                entry = LigandEntry(res_ag=res_ag, smi_mol=template, lig_mol=template,
+                                    residue_id=residue_id, chemistry_source=source,
+                                    chemistry_smiles=canon)
+                break
+            if lig_mol is None:
+                continue
+            try:
+                assigned = assign_bond_orders(template, lig_mol)
+            except Exception as e:
+                if source == 'user':
+                    raise ValueError(
+                        f"Could not assign bond orders for ligand residue {residue_id} from SMILES "
+                        f"{smi!r}: {e}. If the complex contains multiple different ligands, provide one "
+                        "SMILES per ligand residue (matched in chain/resnum order) or a "
+                        "{resname: SMILES} mapping."
+                    ) from e
+                mismatch_errors.append(f"{source}: {e}")
+                continue  # auto sources are best-effort: fall through to the next one
+            entry = LigandEntry(res_ag=res_ag, smi_mol=template, lig_mol=assigned,
+                                residue_id=residue_id, chemistry_source=source,
+                                chemistry_smiles=canon)
+            break
+
+        if entry is None:
+            reason = ("no chemistry source produced a matching template "
+                      f"(tried: {', '.join(c[1] for c in candidates) or 'none'})"
+                      + (f"; mismatches: {'; '.join(mismatch_errors)}" if mismatch_errors else ""))
+            excluded.append({'residue_id': residue_id, 'reason': reason})
+            print(f"[bunsalyze] WARNING: excluding ligand residue {residue_id} from scoring: "
+                  f"{reason}", file=sys.stderr)
+            continue
+        if entry.chemistry_source == 'geometry_perception':
+            print(f"[bunsalyze] WARNING: ligand {residue_id} chemistry perceived from geometry "
+                  "alone (no user SMILES, no chemistry records in the input mmCIF, no matching "
+                  "CCD entry). Bond orders and protonation state are guesses — treat this "
+                  "ligand's BUNS with caution.", file=sys.stderr)
+        ligand_entries.append(entry)
+        kept_resindices.append(ridx)
+
+    if not ligand_entries:
+        raise ValueError(
+            "No scoring-compatible ligand residues found. "
+            + "; ".join(f"{e['residue_id']}: {e['reason']}" for e in excluded)
+        )
+    if excluded:
+        lig_ag = lig_ag.select('resindex ' + ' '.join(str(r) for r in kept_resindices)).copy()
+
+    return prot_ag, lig_ag, ligand_entries, excluded
 
 
 def _ligand_atom_label(atom: PolarAtom, multi_ligand: bool) -> str:
@@ -413,23 +518,37 @@ def compute_capacity_score(
 
 
 def main(
-    input_path: os.PathLike, smiles,
+    input_path: os.PathLike, smiles=None,
     sasa_threshold: float = 2.5, silent: bool = True, disable_hydrogen_clash_check: bool = False,
-    alpha_hull_alpha: float = 14.0, override_ligand_selection_string: str = 'not protein',
+    alpha_hull_alpha: float = 14.0, override_ligand_selection_string: str = DEFAULT_LIGAND_SELECTION,
     ncaa_dict: dict = {}, ignore_sulfur_acceptors: bool = False, ignore_sasa_threshold: bool = False,
     use_ca_donors: bool = False, ignore_all_burial_criteria: bool = False,
     covalent_hydrogen_max_distance: float = 1.2, ignore_ligand_intramolecular_hbonds: bool = False,
     report_weak_acceptor_buns: bool = False, ignore_ligand_sasa_threshold: bool = False,
-    shells: int = 3, shell_dist: float = 5.0,
+    shells: int = 3, shell_dist: float = 5.0, allow_ccd_lookup: bool = True,
 ) -> dict:
 
-    protein_complex = pr.parsePDB(str(input_path))
-    assert protein_complex is not None, f"Failed to parse PDB file at {input_path}"
+    input_path = str(input_path)
+    is_mmcif = os.path.splitext(input_path)[1].lower() in _MMCIF_SUFFIXES
+    if is_mmcif:
+        protein_complex = _parse_mmcif_compat(input_path)
+    else:
+        protein_complex = pr.parsePDB(input_path)
+    assert protein_complex is not None, f"Failed to parse structure file at {input_path}"
 
     # Load the relevant protein and ligand data. One RDKit mol is built per ligand residue;
     # a single SMILES is broadcast to all residues (e.g. multiple copies of the same ligand).
-    prot_ag, lig_ag, ligand_entries = parse_complex_and_build_rdkit_ligand(protein_complex, smiles, override_ligand_selection_string)
+    # Residues without a user SMILES are auto-resolved (input mmCIF bond table -> CCD lookup
+    # -> geometry perception); residues no source can describe are excluded from scoring.
+    prot_ag, lig_ag, ligand_entries, excluded = parse_complex_and_build_rdkit_ligand(
+        protein_complex, smiles, override_ligand_selection_string,
+        input_path=input_path, allow_ccd_lookup=allow_ccd_lookup)
     multi_ligand = len(ligand_entries) > 1
+    for entry in ligand_entries:
+        if entry.chemistry_source != 'user':
+            print(f"[bunsalyze] ligand {entry.residue_id}: chemistry auto-resolved from "
+                  f"{entry.chemistry_source} (SMILES: {entry.chemistry_smiles})",
+                  file=sys.stderr)
     ca_coords = prot_ag.select('name CA').getCoords()
 
     # Get the hbond-able polar atoms. Atom names are unique within a single residue, so the
@@ -442,7 +561,21 @@ def main(
             covalent_hydrogen_max_distance=covalent_hydrogen_max_distance,
         ))
     protein_polar_atoms = get_protein_polar_atoms(prot_ag, ncaa_dict=ncaa_dict, use_sulfur_acceptors=not ignore_sulfur_acceptors, use_ca_donors=use_ca_donors, silent=silent)
-    ligand_burial_annotations = set_burial_annotations(ligand_polar_atoms, protein_polar_atoms, ca_coords, input_path, sasa_threshold=sasa_threshold, silent=silent, alpha_hull_alpha=alpha_hull_alpha, ignore_sasa_threshold=ignore_sasa_threshold, ignore_all_burial_criteria=ignore_all_burial_criteria, ignore_ligand_sasa_threshold=ignore_ligand_sasa_threshold, multi_ligand=multi_ligand)
+    # freesasa only reads PDB files; for mmCIF inputs stage a temporary PDB rendering of
+    # the parsed complex (atom naming is identical by construction, so the freesasa
+    # per-atom selections in set_burial_annotations still match).
+    freesasa_input = input_path
+    _tmp_pdb = None
+    if is_mmcif:
+        fd, _tmp_pdb = tempfile.mkstemp(suffix='.pdb', prefix='bunsalyze_')
+        os.close(fd)
+        pr.writePDB(_tmp_pdb, protein_complex)
+        freesasa_input = _tmp_pdb
+    try:
+        ligand_burial_annotations = set_burial_annotations(ligand_polar_atoms, protein_polar_atoms, ca_coords, freesasa_input, sasa_threshold=sasa_threshold, silent=silent, alpha_hull_alpha=alpha_hull_alpha, ignore_sasa_threshold=ignore_sasa_threshold, ignore_all_burial_criteria=ignore_all_burial_criteria, ignore_ligand_sasa_threshold=ignore_ligand_sasa_threshold, multi_ligand=multi_ligand)
+    finally:
+        if _tmp_pdb is not None:
+            os.unlink(_tmp_pdb)
 
     # Build a radius graph of the polar atoms and compute the buns for the ligand and protein.
     g = PolarAtomGraph(
@@ -500,6 +633,8 @@ def main(
         )
         per_ligand.append({
             'residue_id': entry.residue_id,
+            'chemistry_source': entry.chemistry_source,
+            'chemistry_smiles': entry.chemistry_smiles,
             'ligand_buns': [(str(a.name), *a.parent_group_identifier, a.is_weak_acceptor) for a in buns_i],
             'n_ligand_buns': len(buns_i),
             'n_buried_ligand_polar_atoms': n_buried_i,
@@ -512,6 +647,7 @@ def main(
         'input_path': str(input_path),
         'n_ligand_residues': len(ligand_entries),
         'per_ligand': per_ligand,
+        'excluded_ligands': excluded,
         'ligand_buns': [(str(i.name), *i.parent_group_identifier, i.is_weak_acceptor) for i in ligand_buns],
         'protein_buns': [(str(i.name), *i.parent_group_identifier, i.is_weak_acceptor) for i in protein_buns],
         'buns_score': (2 * len(ligand_buns)) + len(protein_buns),
@@ -540,14 +676,15 @@ def cli():
     """Command-line interface entry point."""
     import argparse
     parser = argparse.ArgumentParser(description="Analyze protein-ligand complexes for buried unsatisfied polar atoms (BUNs).")
-    parser.add_argument("input_path", type=str, help="Path to the PDB file containing the protein-ligand complex")
-    parser.add_argument("smiles", type=str, nargs='*', help="SMILES string(s) for the ligand(s). A single SMILES is broadcast to every ligand residue (e.g. multiple copies of the same ligand); with multiple different ligands, give one SMILES per ligand residue in (chain, resnum) order, or use --smiles_map.")
-    parser.add_argument('--smiles_map', type=str, default='', help='Dictionary string mapping ligand residues to SMILES, keyed by resname, chain ID, or chain:resnum — e.g. \'{"FAD": "..."}\' or \'{"B": "...", "C": "..."}\'. Alternative to positional SMILES; the fail-proof option for multiple different ligands.')
+    parser.add_argument("input_path", type=str, help="Path to the structure file (PDB or mmCIF) containing the protein-ligand complex")
+    parser.add_argument("smiles", type=str, nargs='*', help="SMILES string(s) for the ligand(s). Optional: ligand residues without a SMILES are auto-resolved (input mmCIF bond table -> CCD lookup -> geometry perception) and the source used is recorded per ligand as chemistry_source in the output. A single SMILES is broadcast to every ligand residue (e.g. multiple copies of the same ligand); with multiple different ligands, give one SMILES per ligand residue in (chain, resnum) order, or use --smiles_map.")
+    parser.add_argument('--smiles_map', type=str, default='', help='Dictionary string mapping ligand residues to SMILES, keyed by resname, chain ID, or chain:resnum — e.g. \'{"FAD": "..."}\' or \'{"B": "...", "C": "..."}\'. Alternative to positional SMILES; the fail-proof option for multiple different ligands. Residues not covered by the map are auto-resolved.')
+    parser.add_argument('--no_ccd_lookup', action='store_true', help='If set, skips the CCD (RCSB chemcomp API) step of ligand chemistry auto-resolution — offline mode. The input mmCIF bond table and geometry perception still apply.')
     parser.add_argument("--sasa_threshold", type=float, default=2.5, help="SASA threshold for burial (default: 2.5 Å²)")
     parser.add_argument("--alpha_hull_alpha", type=float, default=14.0, help="Alpha-shape alpha parameter (larger = looser, closer to the convex hull; default is 14.0)")
     parser.add_argument("--output", type=str, help="Output file path (default: print to stdout)")
     parser.add_argument("--disable_hydrogen_clash_check", action='store_true', help="Default behavior doesn't count hbonds made at the expense of a hydrogen vdW clash. Set this flag to disable that check.")
-    parser.add_argument('--override_ligand_selection_string', type=str, default='not protein', help='How to select the ligand from the PDB file, default is "not protein" but this fails with noncanonical amino acids.')
+    parser.add_argument('--override_ligand_selection_string', type=str, default=DEFAULT_LIGAND_SELECTION, help=f'How to select the ligand(s) from the structure file. Default is "{DEFAULT_LIGAND_SELECTION}", which scores every non-protein, non-nucleic, non-water, non-ion residue as a ligand.')
     parser.add_argument('--ignore_ligand_intramolecular_hbonds', action='store_true', help='If set, ignores intramolecular hbonds within the ligand when determining if a hbond is satisfied. Default behavior counts intramolecular ligand hbonds as satisfying capacity.')
 
     ncaa_dict_example_str = r'{"DJD": {"N": (0, ["H"]), "O": (2, []), "N03": (1, []), "N04": (1, []), "N05": (1, []), "N06": (1, [])}}'
@@ -575,9 +712,9 @@ def cli():
 
     if args.smiles and args.smiles_map:
         parser.error("Provide either positional SMILES or --smiles_map, not both.")
-    if not args.smiles and not args.smiles_map:
-        parser.error("Provide ligand SMILES: positional argument(s) or --smiles_map.")
-    smiles = args.smiles
+    # No SMILES at all is valid: every ligand residue is auto-resolved (input mmCIF
+    # bond table -> CCD lookup -> geometry perception), with per-ligand provenance.
+    smiles = args.smiles if args.smiles else None
     if args.smiles_map:
         try:
             smiles = ast.literal_eval(args.smiles_map)
@@ -596,6 +733,7 @@ def cli():
         report_weak_acceptor_buns=args.report_weak_acceptor_buns,
         ignore_ligand_sasa_threshold=args.ignore_ligand_sasa_threshold,
         shells=args.shells, shell_dist=args.shell_dist,
+        allow_ccd_lookup=not args.no_ccd_lookup,
     )
     
     if args.output:

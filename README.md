@@ -49,9 +49,10 @@ maps onto ligand residues in three ways:
   - **chain ID** — `{'B': '...', 'C': '...'}` covers the ligand residue in that chain
     (rejected if a chain contains more than one ligand residue);
   - **chain:resnum** — `{'B:501': '...'}` covers exactly one residue.
-  The mapping is validated: every key must match a ligand residue, every residue must be
-  covered exactly once, and keys that are simultaneously a chain ID and a resname are
-  rejected as ambiguous. This is the fail-proof option for multiple different ligands.
+  The mapping is validated: every key must match a ligand residue, no residue may be
+  covered by more than one key, and keys that are simultaneously a chain ID and a resname
+  are rejected as ambiguous. Residues left uncovered by the map are auto-resolved (see
+  below). This is the fail-proof option for multiple different ligands.
 
 ```bash
 # two copies of the same ligand (chains L and M both resname LIG):
@@ -83,50 +84,145 @@ than one ligand residue is present (single-ligand output is unchanged). H-bonds 
 *different* ligand residues count as intermolecular; `--ignore_ligand_intramolecular_hbonds`
 only ignores H-bonds within the same ligand residue.
 
+#### Automatic ligand chemistry (SMILES optional)
+
+The SMILES argument is **optional**. Every ligand residue without a user-supplied SMILES
+is auto-resolved, per residue, by the first source that matches its heavy-atom graph:
+
+1. **explicit user SMILES** (positional / `--smiles_map`) — authoritative; a SMILES that
+   does not match the residue's coordinates is a hard error (`chemistry_source: "user"`).
+2. **the input mmCIF's own chemistry** — the `_chem_comp_bond`/`_chem_comp_atom` tables
+   that RCSB entries carry for CCD ligands (`chemistry_source: "mmcif_bond_table"`), or
+   `_chem_comp.pdbx_smiles`, which AlphaFold 3 writes for its ligands and which preserves
+   the SMILES AF3 was given, protonation state included
+   (`chemistry_source: "mmcif_pdbx_smiles"`).
+3. **CCD lookup by resname** via the RCSB chemcomp API
+   (`chemistry_source: "ccd:<RESNAME>"`; skip with `--no_ccd_lookup` for offline use).
+4. **geometry perception** from the coordinates alone
+   (`chemistry_source: "geometry_perception"`) — least reliable (geometry-dependent, blind
+   to tautomers/protonation); a loud stderr warning is emitted for every such ligand.
+
+Auto-derived sources (2–4) are best-effort: if a source's template does not match the
+residue, resolution falls through to the next one. A residue no source can describe is
+**excluded from scoring** and recorded in the top-level `excluded_ligands` list (with a
+stderr warning); the run only fails if *no* ligand residue is scoring-compatible. Every
+`per_ligand` entry records `chemistry_source` and `chemistry_smiles` (the canonical SMILES
+of the template actually used), so an implicit choice is always an auditable choice.
+
+mmCIF inputs (`.cif`/`.mmcif`/`.bcif`) are parsed directly; SASA calculation is handled
+through an internal PDB rendering since freesasa only reads PDB. The default ligand
+selection is `not protein and not nucleic and not water and not ion`, so multi-ligand
+structures are scored without any selection flags (waters/ions are never scored as
+ligands); override with `--override_ligand_selection_string`.
+
+```bash
+# RCSB entry: biotin chemistry comes from the entry's own bond table
+bunsalyze 1stp.cif
+
+# AF3 model: ligand chemistry comes from AF3's _chem_comp.pdbx_smiles records
+bunsalyze fold_model.cif
+
+# offline: never query the CCD
+bunsalyze complex.pdb --no_ccd_lookup
+```
+
 Here is the result of the `-h`/`--help` flag:
 
 ```text
-usage: bunsalyze [-h] [--sasa_threshold SASA_THRESHOLD] [--alpha_hull_alpha ALPHA_HULL_ALPHA] [--output OUTPUT] [--disable_hydrogen_clash_check] [--override_ligand_selection_string OVERRIDE_LIGAND_SELECTION_STRING] [--ignore_ligand_intramolecular_hbonds] [--ncaa_dict NCAA_DICT] [--ignore_sulfur_acceptors] [--ignore_sasa_threshold]
+usage: bunsalyze [-h] [--smiles_map SMILES_MAP] [--no_ccd_lookup]
+                 [--sasa_threshold SASA_THRESHOLD]
+                 [--alpha_hull_alpha ALPHA_HULL_ALPHA] [--output OUTPUT]
+                 [--disable_hydrogen_clash_check]
+                 [--override_ligand_selection_string OVERRIDE_LIGAND_SELECTION_STRING]
+                 [--ignore_ligand_intramolecular_hbonds]
+                 [--ncaa_dict NCAA_DICT] [--ignore_sulfur_acceptors]
+                 [--ignore_sasa_threshold] [--ignore_ligand_sasa_threshold]
                  [--use_ca_donors] [--verbose] [--report_weak_acceptor_buns]
-                 input_path smiles
+                 [--shells SHELLS] [--shell_dist SHELL_DIST]
+                 input_path [smiles ...]
 
 Analyze protein-ligand complexes for buried unsatisfied polar atoms (BUNs).
 
 positional arguments:
-  input_path            Path to the PDB file containing the protein-ligand complex
-  smiles                SMILES string representing the ligand
+  input_path            Path to the structure file (PDB or mmCIF) containing
+                        the protein-ligand complex
+  smiles                SMILES string(s) for the ligand(s). Optional: ligand
+                        residues without a SMILES are auto-resolved (input
+                        mmCIF bond table -> CCD lookup -> geometry perception)
+                        and the source used is recorded per ligand as
+                        chemistry_source in the output. A single SMILES is
+                        broadcast to every ligand residue (e.g. multiple
+                        copies of the same ligand); with multiple different
+                        ligands, give one SMILES per ligand residue in (chain,
+                        resnum) order, or use --smiles_map.
 
 options:
   -h, --help            show this help message and exit
+  --smiles_map SMILES_MAP
+                        Dictionary string mapping ligand residues to SMILES,
+                        keyed by resname, chain ID, or chain:resnum — e.g.
+                        '{"FAD": "..."}' or '{"B": "...", "C": "..."}'.
+                        Alternative to positional SMILES; the fail-proof
+                        option for multiple different ligands. Residues not
+                        covered by the map are auto-resolved.
+  --no_ccd_lookup       If set, skips the CCD (RCSB chemcomp API) step of
+                        ligand chemistry auto-resolution — offline mode. The
+                        input mmCIF bond table and geometry perception still
+                        apply.
   --sasa_threshold SASA_THRESHOLD
                         SASA threshold for burial (default: 2.5 Å²)
   --alpha_hull_alpha ALPHA_HULL_ALPHA
-                        Alpha-shape alpha parameter (larger = looser, closer to the convex hull; default is 14.0)
+                        Alpha-shape alpha parameter (larger = looser, closer
+                        to the convex hull; default is 14.0)
   --output OUTPUT       Output file path (default: print to stdout)
   --disable_hydrogen_clash_check
-                        Default behavior doesn't count hbonds made at the expense of a hydrogen vdW clash. Set this flag to disable that check.
+                        Default behavior doesn't count hbonds made at the
+                        expense of a hydrogen vdW clash. Set this flag to
+                        disable that check.
   --override_ligand_selection_string OVERRIDE_LIGAND_SELECTION_STRING
-                        How to select the ligand from the PDB file, default is "not protein" but this fails with noncanonical amino acids.
+                        How to select the ligand(s) from the structure file.
+                        Default is "not protein and not nucleic and not water
+                        and not ion", which scores every non-protein, non-
+                        nucleic, non-water, non-ion residue as a ligand.
   --ignore_ligand_intramolecular_hbonds
-                        If set, ignores intramolecular hbonds within the ligand when determining if a hbond is satisfied. Default behavior counts intramolecular ligand hbonds as satisfying capacity.
+                        If set, ignores intramolecular hbonds within the
+                        ligand when determining if a hbond is satisfied.
+                        Default behavior counts intramolecular ligand hbonds
+                        as satisfying capacity.
   --ncaa_dict NCAA_DICT
-                        Dictionary mapping ncaa 3-letter code to polar atoms which map to tuples of (# hbonds atom can accept, list of atom names of attached donor hydrogens). Format: '{"DJD": {"N": (0, ["H"]), "O": (2, []), "N03": (1, []), "N04": (1, []), "N05": (1, []), "N06": (1, [])}}'
+                        Dictionary mapping ncaa 3-letter code to polar atoms
+                        which map to tuples of (# hbonds atom can accept, list
+                        of atom names of attached donor hydrogens). Format:
+                        '{"DJD": {"N": (0, ["H"]), "O": (2, []), "N03": (1,
+                        []), "N04": (1, []), "N05": (1, []), "N06": (1, [])}}'
   --ignore_sulfur_acceptors
-                        If set, ignores sulfur atoms as potential acceptors. Default behavior includes sulfur atoms as acceptors.
+                        If set, ignores sulfur atoms as potential acceptors.
+                        Default behavior includes sulfur atoms as acceptors.
   --ignore_sasa_threshold
-                        If set, does not use a SASA threshold to determine burial, only uses convex hull. Default behavior uses both SASA and convex hull.
+                        If set, does not use a SASA threshold to determine
+                        burial, only uses convex hull. Default behavior uses
+                        both SASA and convex hull.
   --ignore_ligand_sasa_threshold
-                        If set, does not use a SASA threshold to determine ligand burial, only uses convex hull. Default behavior uses both SASA and convex hull for the ligand.
-  --use_ca_donors       If set, uses CA atoms as potential donors. Default behavior does not use CA atoms as hbond donors.
-  --verbose, -v         If set, prints additional information about the analysis to the console.
+                        If set, does not use a SASA threshold to determine
+                        ligand burial, only uses convex hull. Default behavior
+                        uses both SASA and convex hull for the ligand.
+  --use_ca_donors       If set, uses CA atoms as potential donors. Default
+                        behavior does not use CA atoms as hbond donors.
+  --verbose, -v         If set, prints additional information about the
+                        analysis to the console.
   --report_weak_acceptor_buns
-                        If set, reports weak acceptors (such as ligand aromatic nitrogen atoms without hydrogens) as BUNs. Default is False.
-  --shells SHELLS       Number of sidechain-contact shells to expand from the ligand for the
-                        shell_buns breakdown (default: 3). Shell 1: residues with a sidechain atom
-                        within --shell_dist of any ligand heavy atom; shell k: residues within
-                        --shell_dist of any shell-(k-1) sidechain atom.
+                        If set, reports weak acceptors (such as ligand
+                        aromatic nitrogen atoms without hydrogens) as BUNs.
+                        Default is False.
+  --shells SHELLS       Number of sidechain-contact shells to expand from the
+                        ligand for the shell_buns breakdown (default: 3).
+                        Shell 1: residues with a sidechain atom within
+                        --shell_dist of any ligand heavy atom; shell k:
+                        residues within --shell_dist of any shell-(k-1)
+                        sidechain atom.
   --shell_dist SHELL_DIST
-                        Heavy-atom contact distance (Å) used to define shell membership (default: 5.0).
+                        Heavy-atom contact distance (Å) used to define shell
+                        membership (default: 5.0).
 ```
 
 The output always includes a `shell_buns` key with the following structure:
@@ -198,4 +294,5 @@ The `buns_capacity_score` is the sum of the ligand_buried_per_atom_capacity valu
 
 ### TODO:
 - [x] Add support for multiple ligands
+- [x] Automatic ligand chemistry resolution with per-ligand provenance (SMILES optional)
 - [ ] Support NCAAs with planar aromatic groups similar to HIS.
